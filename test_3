@@ -1,0 +1,277 @@
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, Text
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+import sqlite3
+import pytz
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Конфигурация
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+TIMEZONE = pytz.timezone("Europe/Moscow")
+
+# Инициализация базы данных
+conn = sqlite3.connect("reminders.db")
+cursor = conn.cursor()
+
+# Создание таблицы
+cursor.execute('''CREATE TABLE IF NOT EXISTS reminders
+               (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                text TEXT,
+                next_time DATETIME,
+                interval TEXT,
+                is_active BOOLEAN DEFAULT 1)''')
+conn.commit()
+
+# Инициализация бота
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+class ReminderStates(StatesGroup):
+    waiting_for_text = State()
+    waiting_for_time = State()
+    waiting_for_interval = State()
+
+# Клавиатуры
+def main_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.add(types.InlineKeyboardButton(
+        text="Установить напоминание",
+        callback_data="set_reminder")
+    )
+    builder.add(types.InlineKeyboardButton(
+        text="Мои напоминания",
+        callback_data="list_reminders")
+    )
+    return builder.as_markup()
+
+def interval_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.add(types.InlineKeyboardButton(
+        text="Однократно",
+        callback_data="interval:once")
+    )
+    builder.add(types.InlineKeyboardButton(
+        text="Ежедневно",
+        callback_data="interval:daily")
+    )
+    builder.add(types.InlineKeyboardButton(
+        text="Еженедельно",
+        callback_data="interval:weekly")
+    )
+    return builder.as_markup()
+
+# Загрузка активных напоминаний при старте
+async def load_active_reminders():
+    cursor.execute("SELECT * FROM reminders WHERE is_active=1")
+    active_reminders = cursor.fetchall()
+    for reminder in active_reminders:
+        user_id = reminder[1]
+        await create_reminder_task(user_id, reminder)
+
+async def create_reminder_task(user_id, reminder):
+    now = datetime.now(TIMEZONE)
+    next_time = datetime.strptime(reminder[3], "%Y-%m-%d %H:%M:%S").astimezone(TIMEZONE)
+    
+    if next_time < now:
+        if reminder[4] == 'once':
+            cursor.execute("UPDATE reminders SET is_active=0 WHERE id=?", (reminder[0],))
+            conn.commit()
+            return
+        next_time = calculate_next_time(next_time, reminder[4])
+    
+    delay = (next_time - now).total_seconds()
+    task = asyncio.create_task(
+        send_reminder(
+            user_id=user_id,
+            reminder_id=reminder[0],
+            text=reminder[2],
+            interval=reminder[4],
+            delay=delay
+        )
+    )
+    return task
+
+def calculate_next_time(time, interval):
+    if interval == "daily":
+        return time + timedelta(days=1)
+    elif interval == "weekly":
+        return time + timedelta(weeks=1)
+    return time
+
+# Команда /start
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "⏰ Бот-напоминалка с расширенными функциями!\n"
+        "Выберите действие:",
+        reply_markup=main_keyboard()
+    )
+
+# Обработка установки напоминания
+@dp.callback_query(Text("set_reminder"))
+async def set_reminder(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите текст напоминания:")
+    await state.set_state(ReminderStates.waiting_for_text)
+    await callback.answer()
+
+# Обработка текста напоминания
+@dp.message(ReminderStates.waiting_for_text)
+async def process_text(message: types.Message, state: FSMContext):
+    await state.update_data(text=message.text)
+    await message.answer("Выберите тип напоминания:", reply_markup=interval_keyboard())
+    await state.set_state(ReminderStates.waiting_for_interval)
+
+# Обработка интервала
+@dp.callback_query(Text(startswith="interval:"), ReminderStates.waiting_for_interval)
+async def process_interval(callback: types.CallbackQuery, state: FSMContext):
+    interval = callback.data.split(":")[1]
+    await state.update_data(interval=interval)
+    
+    if interval == "once":
+        await callback.message.answer("Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ")
+        await state.set_state(ReminderStates.waiting_for_time)
+    else:
+        await callback.message.answer("Введите время в формате ЧЧ:ММ")
+        await state.set_state(ReminderStates.waiting_for_time)
+    
+    await callback.answer()
+
+# Обработка времени
+@dp.message(ReminderStates.waiting_for_time)
+async def process_time(message: types.Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        interval = data.get("interval", "once")
+        
+        if interval == "once":
+            time = datetime.strptime(message.text, "%d.%m.%Y %H:%M")
+        else:
+            time = datetime.strptime(message.text, "%H:%M")
+            time = datetime.now().replace(
+                hour=time.hour,
+                minute=time.minute,
+                second=0,
+                microsecond=0
+            )
+        
+        time = time.astimezone(TIMEZONE)
+        
+        if time < datetime.now(TIMEZONE):
+            raise ValueError("Время должно быть в будущем")
+        
+        # Сохранение в базу данных
+        cursor.execute(
+            "INSERT INTO reminders (user_id, text, next_time, interval) VALUES (?, ?, ?, ?)",
+            (message.from_user.id, data['text'], time.strftime("%Y-%m-%d %H:%M:%S"), data['interval'])
+        )
+        conn.commit()
+        
+        # Создание задачи
+        reminder_id = cursor.lastrowid
+        task = await create_reminder_task(message.from_user.id, (
+            reminder_id,
+            message.from_user.id,
+            data['text'],
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            data['interval'],
+            1
+        ))
+        
+        await message.answer("✅ Напоминание успешно установлено!")
+        await state.clear()
+
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await message.answer("❌ Ошибка в формате времени! Попробуйте снова.")
+
+# Отправка напоминания
+async def send_reminder(user_id: int, reminder_id: int, text: str, interval: str, delay: float):
+    try:
+        await asyncio.sleep(delay)
+        await bot.send_message(user_id, f"⏰ Напоминание: {text}")
+        
+        if interval != "once":
+            cursor.execute("SELECT next_time FROM reminders WHERE id=?", (reminder_id,))
+            next_time = datetime.strptime(cursor.fetchone()[0], "%Y-%m-%d %H:%M:%S")
+            next_time = calculate_next_time(next_time, interval)
+            
+            cursor.execute(
+                "UPDATE reminders SET next_time=? WHERE id=?",
+                (next_time.strftime("%Y-%m-%d %H:%M:%S"), reminder_id)
+            )
+            conn.commit()
+            
+            new_delay = (next_time - datetime.now(TIMEZONE)).total_seconds()
+            asyncio.create_task(
+                send_reminder(
+                    user_id=user_id,
+                    reminder_id=reminder_id,
+                    text=text,
+                    interval=interval,
+                    delay=new_delay
+                )
+            )
+        else:
+            cursor.execute("UPDATE reminders SET is_active=0 WHERE id=?", (reminder_id,))
+            conn.commit()
+
+    except Exception as e:
+        logger.error(f"Ошибка отправки: {e}")
+
+# Список напоминаний
+@dp.callback_query(Text("list_reminders"))
+async def list_reminders(callback: types.CallbackQuery):
+    cursor.execute(
+        "SELECT id, text, next_time, interval FROM reminders WHERE user_id=? AND is_active=1",
+        (callback.from_user.id,)
+    )
+    reminders = cursor.fetchall()
+    
+    if not reminders:
+        await callback.message.answer("У вас нет активных напоминаний")
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for rem in reminders:
+        builder.add(types.InlineKeyboardButton(
+            text=f"{rem[1]} ({rem[3]} в {rem[2][11:16]})",
+            callback_data=f"delete_reminder:{rem[0]}"
+        ))
+    
+    builder.adjust(1)
+    await callback.message.answer(
+        "Ваши активные напоминания:\n(Нажмите для удаления)",
+        reply_markup=builder.as_markup()
+    )
+    await callback.answer()
+
+# Удаление напоминания
+@dp.callback_query(Text(startswith="delete_reminder:"))
+async def delete_reminder(callback: types.CallbackQuery):
+    reminder_id = callback.data.split(":")[1]
+    cursor.execute("UPDATE reminders SET is_active=0 WHERE id=?", (reminder_id,))
+    conn.commit()
+    await callback.message.edit_text("✅ Напоминание удалено")
+    await callback.answer()
+
+# Запуск бота
+async def main():
+    await load_active_reminders()
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
